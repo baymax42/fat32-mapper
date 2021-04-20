@@ -39,9 +39,18 @@ class DirectoryEntry:
     def is_directory(self):
         return True if self.attrs & DirectoryEntry.ATTR_DIRECTORY > 0 else False
 
+    def __str__(self):
+        return f'name: {self.name}\n' \
+               f'attrs: {self.attrs}\n' \
+               f'creation_time_tenth_milis: {self.creation_time_tenth_milis}\n' \
+               f'first_data_cluster: {self.first_data_cluster}\n' \
+               f'write_time: {self.write_time}\n' \
+               f'write_date: {self.write_date}\n' \
+               f'file_size: {self.file_size}' 
+
 
 class Fat32Partition(Vfat):
-    FAT_ENTRY_FORMAT = 'I'
+    FAT_ENTRY_FORMAT = 'L'
     EOC_START = c_uint32(0x0FFFFFF8)
 
     def __init__(self, _io):
@@ -133,6 +142,15 @@ def get_fat32_partition(image_io: BytesIO, sector: int) -> (Fat32Partition, int)
             return vfat_partition, partition.lba_start
     return None, 0
 
+def find_file(fat32_partition: Fat32Partition, partition_lba: int, cluster: int) -> DirectoryEntry:
+    fat = fat32_partition.raw_file_allocation_table
+    for i in range(len(fat)):
+        entries = [entry for entry in fat32_partition.next_file_in_directory(i, partition_lba)]
+        for j in range(len(entries)):
+            if entries[j].first_data_cluster-1 == first_cluster:
+                return entries[j]
+    return None
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Map section to specific file in FAT32 volume')
@@ -175,7 +193,10 @@ if __name__ == '__main__':
 
     print("Cluster number:", cluster_num)
 
-    print("First cluster of the found file:", fat32_partition.find_first_cluster(cluster_num))
+    first_cluster = fat32_partition.find_first_cluster(cluster_num)
+    print("First cluster of the found file:", first_cluster)
 
-    entries = [entry.name for entry in fat32_partition.next_file_in_directory(0, partition_lba)]
-    print(entries)
+    result = find_file(fat32_partition, partition_lba, first_cluster)
+
+    print()
+    print(result)
