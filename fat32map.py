@@ -1,10 +1,12 @@
 import argparse
+import queue
 import struct
 from array import array
 from ctypes import c_uint32
 from io import BytesIO
 from math import floor
 from os import path
+from typing import Union
 
 from parser.mbr_partition_table import MbrPartitionTable
 from parser.vfat import Vfat
@@ -16,6 +18,8 @@ DIR_ENTRY_SIZE = 32
 class DirectoryEntry:
     FORMAT = '<11sB7xBHHHHI'
     ATTR_DIRECTORY = 0x10
+    ATTR_VOLUME_ID = 0x08
+    ATTR_LONG_DIR = 0xF
 
     def __init__(self, bytes):
         data = struct.unpack(DirectoryEntry.FORMAT, bytes)
@@ -33,24 +37,31 @@ class DirectoryEntry:
 
     @property
     def filename(self):
-        return str(self.name)
+        if self.name[0] == 0xe5:
+            decoded_name = '?' + self.name[1:].decode('ascii')
+        else:
+            decoded_name = self.name.decode('ascii')
+        return f'{decoded_name[0:8].rstrip()}.{decoded_name[8:]}'
 
     @property
     def is_directory(self):
-        return True if self.attrs & DirectoryEntry.ATTR_DIRECTORY > 0 else False
+        combined_attrs = (DirectoryEntry.ATTR_DIRECTORY | DirectoryEntry.ATTR_VOLUME_ID)
+        if self.attrs & DirectoryEntry.ATTR_LONG_DIR == DirectoryEntry.ATTR_LONG_DIR:
+            return False
+        return self.attrs & combined_attrs == DirectoryEntry.ATTR_DIRECTORY
 
     def __str__(self):
-        return f'name: {self.name}\n' \
+        return f'name: {self.filename}\n' \
                f'attrs: {self.attrs}\n' \
                f'creation_time_tenth_milis: {self.creation_time_tenth_milis}\n' \
                f'first_data_cluster: {self.first_data_cluster}\n' \
                f'write_time: {self.write_time}\n' \
                f'write_date: {self.write_date}\n' \
-               f'file_size: {self.file_size}' 
+               f'file_size: {self.file_size}'
 
 
 class Fat32Partition(Vfat):
-    FAT_ENTRY_FORMAT = 'L'
+    FAT_ENTRY_FORMAT = 'I'
     EOC_START = c_uint32(0x0FFFFFF8)
 
     def __init__(self, _io):
@@ -63,7 +74,7 @@ class Fat32Partition(Vfat):
         return fat_chain_element >= Fat32Partition.EOC_START.value
 
     @property
-    def raw_file_allocation_table(self) -> array:
+    def raw_file_allocation_table(self) -> list:
         """
         Returns first non-empty (if exists, else last one) file allocation table.
         It does not compare them in any way.
@@ -74,7 +85,10 @@ class Fat32Partition(Vfat):
                 current_fat_bytes = bytearray(fat)
                 if len(current_fat_bytes) == current_fat_bytes.count(0):
                     continue
-            self.fat = array(self.FAT_ENTRY_FORMAT, current_fat_bytes)
+            self.fat = list(map(
+                lambda fat_entry: fat_entry & 0x0FFFFFFF,
+                array(self.FAT_ENTRY_FORMAT, current_fat_bytes)
+            ))
         return self.fat
 
     @property
@@ -100,11 +114,13 @@ class Fat32Partition(Vfat):
         return cluster_num + 2
 
     def cluster_to_byte(self, cluster: int) -> int:
-        return self.boot_sector.bpb.ls_per_clus * cluster * self.boot_sector.bpb.bytes_per_ls
+        # First two clusters are not used in data section, pad it properly
+        return self.boot_sector.bpb.ls_per_clus * (cluster - 2) * self.boot_sector.bpb.bytes_per_ls
 
     def next_file_in_directory(self, first_dir_cluster, partition_lba):
         io = self._io._io
         offset, end_of_dir = 0, False
+        next_clus = first_dir_cluster
 
         fat = self.raw_file_allocation_table
         partition_byte_offset = partition_lba * MBR_SECTOR_SIZE
@@ -119,13 +135,35 @@ class Fat32Partition(Vfat):
                 yield entry
             offset += DIR_ENTRY_SIZE
             # Traverse the next cluster from FAT
-            if current_dir_byte_offset + offset > current_dir_byte_offset + cluster_byte_size:
-                next_clus = fat[first_dir_cluster]
-                if self.is_eoc(next_clus):
+            if offset >= cluster_byte_size:
+                print(next_clus)
+                next_clus = fat[next_clus]
+                if self.is_eoc(next_clus) or next_clus == 0:
                     end_of_dir = True
                 current_dir_byte_offset = partition_byte_offset + self.cluster_to_byte(
                     next_clus) + directory_section_byte_offset
                 offset = 0
+
+    def find_file_by_first_cluster(self, first_cluster: int, partition_lba: int) -> Union[DirectoryEntry, None]:
+        directories_clus = queue.Queue()
+        root_dir_clus = self.boot_sector.ebpb_fat32.root_dir_start_clus
+        directories_clus.put(root_dir_clus)
+        seen_directories = {0, root_dir_clus}
+        while not directories_clus.empty():
+            print(seen_directories)
+            current_dir_clus = directories_clus.get()
+            print("Searching in:", current_dir_clus)
+            for file_entry in self.next_file_in_directory(current_dir_clus, partition_lba):
+                if file_entry.first_data_cluster == first_cluster:
+                    return file_entry
+                elif file_entry.is_directory and file_entry.first_data_cluster not in seen_directories:
+                    try:
+                        print(file_entry.filename)
+                        seen_directories.add(file_entry.first_data_cluster)
+                        directories_clus.put(file_entry.first_data_cluster)
+                    except UnicodeDecodeError:
+                        pass
+        return None
 
 
 def get_fat32_partition(image_io: BytesIO, sector: int) -> (Fat32Partition, int):
@@ -141,15 +179,6 @@ def get_fat32_partition(image_io: BytesIO, sector: int) -> (Fat32Partition, int)
         if partition_sector_start <= sector <= partition_sector_end and vfat_partition.boot_sector.is_fat32:
             return vfat_partition, partition.lba_start
     return None, 0
-
-def find_file(fat32_partition: Fat32Partition, partition_lba: int, cluster: int) -> DirectoryEntry:
-    fat = fat32_partition.raw_file_allocation_table
-    for i in range(len(fat)):
-        entries = [entry for entry in fat32_partition.next_file_in_directory(i, partition_lba)]
-        for j in range(len(entries)):
-            if entries[j].first_data_cluster-1 == first_cluster:
-                return entries[j]
-    return None
 
 
 if __name__ == '__main__':
@@ -167,7 +196,7 @@ if __name__ == '__main__':
     fat32_partition, partition_lba = get_fat32_partition(image_io, absolute_sector)
 
     if fat32_partition is None:
-        print("Not in FAT32 partition")
+        print("Not in FAT32 partition!")
         exit()
 
     print("Partition LBA", partition_lba)
@@ -180,7 +209,6 @@ if __name__ == '__main__':
 
     print("Sectors per FAT:", boot_sector.ls_per_fat)
     print("Number of FATs:", boot_sector.bpb.num_fats)
-    print("First 32 entries from FAT:", fat[:32])
 
     print("Root dir cluster:", fat32_partition.boot_sector.ebpb_fat32.root_dir_start_clus)
     print("Cluster offset in sectors:", fat32_partition.directory_section_offset)
@@ -188,15 +216,15 @@ if __name__ == '__main__':
     cluster_num = fat32_partition.sector_to_cluster(absolute_sector - partition_lba)
 
     if cluster_num < 0:
-        print("Not in data region")
+        print("Not in data region!")
         exit()
 
     print("Cluster number:", cluster_num)
 
     first_cluster = fat32_partition.find_first_cluster(cluster_num)
-    print("First cluster of the found file:", first_cluster)
+    print("First cluster of the potential file:", first_cluster)
 
-    result = find_file(fat32_partition, partition_lba, first_cluster)
+    result = fat32_partition.find_file_by_first_cluster(first_cluster, partition_lba)
 
-    print()
+    print(f"=======================\nFile containing cluster {first_cluster}")
     print(result)
