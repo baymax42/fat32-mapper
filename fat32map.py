@@ -21,37 +21,63 @@ class DirectoryEntry:
     ATTR_VOLUME_ID = 0x08
     ATTR_LONG_DIR = 0xF
 
-    def __init__(self, bytes):
+    def __init__(self, **kwargs):
+        self._raw_name = kwargs.get('raw_name', '')
+        self.first_data_cluster = kwargs.get('first_clus')
+        self.attrs = 0
+        self.creation_time_tenth_milis = 0
+        self.write_time = 0
+        self.write_date = 0
+        self.file_size = 0
+
+    @property
+    def name(self):
+        if self._raw_name[0] == 0xe5:
+            decoded_name = '?' + self._raw_name[1:].decode('ascii')
+        else:
+            decoded_name = self._raw_name.decode('ascii')
+        extension = decoded_name[8:].rstrip()
+        return f'{decoded_name[0:8].rstrip()}' + (f'.{extension}' if len(extension) > 0 else '')
+
+    @staticmethod
+    def from_bytes(bytes):
         data = struct.unpack(DirectoryEntry.FORMAT, bytes)
-        self.name = data[0]
-        self.attrs = data[1]
-        self.creation_time_tenth_milis = data[2]
-        self.first_data_cluster = (data[3] << 2) + data[6]
-        self.write_time = data[4]
-        self.write_date = data[5]
-        self.file_size = data[7]
+        dir_entry = DirectoryEntry(raw_name=data[0], first_clus=(data[3] << 2) + data[6])
+        dir_entry.attrs = data[1]
+        dir_entry.creation_time_tenth_milis = data[2]
+        dir_entry.write_time = data[4]
+        dir_entry.write_date = data[5]
+        dir_entry.file_size = data[7]
+        return dir_entry
+
+    @staticmethod
+    def root_directory(cluster):
+        return DirectoryEntry(
+            raw_name=b"ROOTDIR",
+            first_clus=cluster,
+        )
 
     @property
     def is_free(self):
-        return self.name[0] == 0x00
+        return self._raw_name[0] == 0x00
 
     @property
-    def filename(self):
-        if self.name[0] == 0xe5:
-            decoded_name = '?' + self.name[1:].decode('ascii')
-        else:
-            decoded_name = self.name.decode('ascii')
-        return f'{decoded_name[0:8].rstrip()}.{decoded_name[8:]}'
+    def _if_filename_decodable(self):
+        try:
+            self._raw_name.decode('ascii')
+        except UnicodeDecodeError:
+            return False
+        return True
 
     @property
     def is_directory(self):
         combined_attrs = (DirectoryEntry.ATTR_DIRECTORY | DirectoryEntry.ATTR_VOLUME_ID)
         if self.attrs & DirectoryEntry.ATTR_LONG_DIR == DirectoryEntry.ATTR_LONG_DIR:
             return False
-        return self.attrs & combined_attrs == DirectoryEntry.ATTR_DIRECTORY
+        return (self.attrs & combined_attrs == DirectoryEntry.ATTR_DIRECTORY) and self._if_filename_decodable
 
     def __str__(self):
-        return f'name: {self.filename}\n' \
+        return f'name: {self.name}\n' \
                f'attrs: {self.attrs}\n' \
                f'creation_time_tenth_milis: {self.creation_time_tenth_milis}\n' \
                f'first_data_cluster: {self.first_data_cluster}\n' \
@@ -95,7 +121,7 @@ class Fat32Partition(Vfat):
     def directory_section_offset(self):
         return self.boot_sector.bpb.num_reserved_ls + (self.boot_sector.ls_per_fat * self.boot_sector.bpb.num_fats)
 
-    def find_first_cluster(self, cluster: int) -> int:
+    def _find_first_cluster_in_fat(self, cluster: int) -> int:
         first_cluster = cluster
         found = True
         fat = self.raw_file_allocation_table
@@ -113,7 +139,7 @@ class Fat32Partition(Vfat):
         cluster_num = floor((relative_sector - clusters_offset) / self.boot_sector.bpb.ls_per_clus)
         return cluster_num + 2
 
-    def cluster_to_byte(self, cluster: int) -> int:
+    def _cluster_to_byte(self, cluster: int) -> int:
         # First two clusters are not used in data section, pad it properly
         return self.boot_sector.bpb.ls_per_clus * (cluster - 2) * self.boot_sector.bpb.bytes_per_ls
 
@@ -125,44 +151,48 @@ class Fat32Partition(Vfat):
         fat = self.raw_file_allocation_table
         partition_byte_offset = partition_lba * MBR_SECTOR_SIZE
         directory_section_byte_offset = self.directory_section_offset * self.boot_sector.bpb.bytes_per_ls
-        current_dir_byte_offset = partition_byte_offset + self.cluster_to_byte(
+        current_dir_byte_offset = partition_byte_offset + self._cluster_to_byte(
             first_dir_cluster) + directory_section_byte_offset
         cluster_byte_size = self.boot_sector.bpb.ls_per_clus * self.boot_sector.bpb.bytes_per_ls
         while not end_of_dir:
             io.seek(current_dir_byte_offset + offset)
-            entry = DirectoryEntry(io.read(DIR_ENTRY_SIZE))
+            entry = DirectoryEntry.from_bytes(io.read(DIR_ENTRY_SIZE))
             if not entry.is_free:
                 yield entry
             offset += DIR_ENTRY_SIZE
             # Traverse the next cluster from FAT
             if offset >= cluster_byte_size:
-                print(next_clus)
                 next_clus = fat[next_clus]
                 if self.is_eoc(next_clus) or next_clus == 0:
                     end_of_dir = True
-                current_dir_byte_offset = partition_byte_offset + self.cluster_to_byte(
+                current_dir_byte_offset = partition_byte_offset + self._cluster_to_byte(
                     next_clus) + directory_section_byte_offset
                 offset = 0
 
-    def find_file_by_first_cluster(self, first_cluster: int, partition_lba: int) -> Union[DirectoryEntry, None]:
+    def _check_if_root_dir_clus(self, cluster):
+        return cluster == self.boot_sector.ebpb_fat32.root_dir_start_clus
+
+    def find_file_by_cluster(self, cluster: int, partition_lba: int) -> Union[DirectoryEntry, None]:
+        first_cluster = self._find_first_cluster_in_fat(cluster)
+
+        if first_cluster == self.boot_sector.ebpb_fat32.root_dir_start_clus:
+            print("\tDetected root dir")
+            return DirectoryEntry.root_directory(first_cluster)
+
         directories_clus = queue.Queue()
         root_dir_clus = self.boot_sector.ebpb_fat32.root_dir_start_clus
         directories_clus.put(root_dir_clus)
         seen_directories = {0, root_dir_clus}
         while not directories_clus.empty():
-            print(seen_directories)
             current_dir_clus = directories_clus.get()
-            print("Searching in:", current_dir_clus)
+            print("Searching in cluster:", current_dir_clus)
             for file_entry in self.next_file_in_directory(current_dir_clus, partition_lba):
                 if file_entry.first_data_cluster == first_cluster:
                     return file_entry
                 elif file_entry.is_directory and file_entry.first_data_cluster not in seen_directories:
-                    try:
-                        print(file_entry.filename)
-                        seen_directories.add(file_entry.first_data_cluster)
-                        directories_clus.put(file_entry.first_data_cluster)
-                    except UnicodeDecodeError:
-                        pass
+                    print("\tFound new directory", file_entry.name)
+                    seen_directories.add(file_entry.first_data_cluster)
+                    directories_clus.put(file_entry.first_data_cluster)
         return None
 
 
@@ -214,17 +244,12 @@ if __name__ == '__main__':
     print("Cluster offset in sectors:", fat32_partition.directory_section_offset)
 
     cluster_num = fat32_partition.sector_to_cluster(absolute_sector - partition_lba)
-
     if cluster_num < 0:
         print("Not in data region!")
         exit()
 
-    print("Cluster number:", cluster_num)
+    print("=" * 45)
 
-    first_cluster = fat32_partition.find_first_cluster(cluster_num)
-    print("First cluster of the potential file:", first_cluster)
-
-    result = fat32_partition.find_file_by_first_cluster(first_cluster, partition_lba)
-
-    print(f"=======================\nFile containing cluster {first_cluster}")
-    print(result)
+    result = fat32_partition.find_file_by_cluster(cluster_num, partition_lba)
+    print("=" * 45)
+    print(result if result is not None else 'No file bound with FAT has been found')
