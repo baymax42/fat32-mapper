@@ -14,12 +14,52 @@ from parser.vfat import Vfat
 MBR_SECTOR_SIZE = 512
 DIR_ENTRY_SIZE = 32
 
+class LFNEntry:
+
+    SEQUENCE_NUMBER_MASK = 0x40    
+    
+    def __init__(self):
+        self.first_byte = 0x0
+        self.name_chars = None
+        self.checksum = 0      
+    
+    @staticmethod
+    def from_bytes(bytes):
+        entry = LFNEntry()
+        entry.first_byte = bytes[0]
+        entry.name_chars = bytes[1:11] + bytes[14:26] + bytes[28:32]
+        entry.checksum = bytes[13]
+        
+        return entry
+        
+    @property
+    def is_deleted(self):
+        return self.first_byte == 0xe5  
+        
+    @property    
+    def is_final(self):
+        return (self.first_byte & self.SEQUENCE_NUMBER_MASK) == self.SEQUENCE_NUMBER_MASK
+           
+    @property
+    def seq_number(self):
+        if self.is_deleted:
+            return -1  
+        if self.is_final:
+            return self.first_byte ^ self.SEQUENCE_NUMBER_MASK
+        
+        return self.first_byte   
+        
+    @property
+    def name(self):
+        return self.name_chars.rstrip(b'\xff').decode("utf-16")   
+    
 
 class DirectoryEntry:
     FORMAT = '<11sB7xBHHHHI'
     ATTR_DIRECTORY = 0x10
     ATTR_VOLUME_ID = 0x08
     ATTR_LONG_DIR = 0xF
+    
 
     def __init__(self, **kwargs):
         self._raw_name = kwargs.get('raw_name', '')
@@ -29,15 +69,25 @@ class DirectoryEntry:
         self.write_time = 0
         self.write_date = 0
         self.file_size = 0
+        
+        self.lfn_entries = []
 
     @property
     def name(self):
-        if self._raw_name[0] == 0xe5:
-            decoded_name = '?' + self._raw_name[1:].decode('ascii')
+        if len(self.lfn_entries) == 0:
+            if self._raw_name[0] == 0xe5:
+                decoded_name = '?' + self._raw_name[1:].decode('ascii')
+            else:
+                decoded_name = self._raw_name.decode('ascii')
+            extension = decoded_name[8:].rstrip()
+            return f'{decoded_name[0:8].rstrip()}' + (f'.{extension}' if len(extension) > 0 else '')
+            
         else:
-            decoded_name = self._raw_name.decode('ascii')
-        extension = decoded_name[8:].rstrip()
-        return f'{decoded_name[0:8].rstrip()}' + (f'.{extension}' if len(extension) > 0 else '')
+            name = ''
+            for entry in self.lfn_entries[::-1]:
+                name = name + entry.name
+            return name
+     
 
     @staticmethod
     def from_bytes(bytes):
@@ -75,6 +125,10 @@ class DirectoryEntry:
         if self.attrs & DirectoryEntry.ATTR_LONG_DIR == DirectoryEntry.ATTR_LONG_DIR:
             return False
         return (self.attrs & combined_attrs == DirectoryEntry.ATTR_DIRECTORY) and self._if_filename_decodable
+        
+    @property
+    def is_lfn_dir(self):
+        return (self.attrs & DirectoryEntry.ATTR_LONG_DIR) == DirectoryEntry.ATTR_LONG_DIR
 
     def __str__(self):
         return f'name: {self.name}\n' \
@@ -154,11 +208,21 @@ class Fat32Partition(Vfat):
         current_dir_byte_offset = partition_byte_offset + self._cluster_to_byte(
             first_dir_cluster) + directory_section_byte_offset
         cluster_byte_size = self.boot_sector.bpb.ls_per_clus * self.boot_sector.bpb.bytes_per_ls
+        
+        lfn_entries = []
         while not end_of_dir:
             io.seek(current_dir_byte_offset + offset)
-            entry = DirectoryEntry.from_bytes(io.read(DIR_ENTRY_SIZE))
-            if not entry.is_free:
-                yield entry
+            bytes = io.read(DIR_ENTRY_SIZE)
+            entry = DirectoryEntry.from_bytes(bytes)
+            
+            if entry.is_lfn_dir:
+                lfn_entries.append(LFNEntry.from_bytes(bytes))                
+            else:
+                entry.lfn_entries = lfn_entries
+                lfn_entries = []
+                if not entry.is_free:
+                    yield entry
+                    
             offset += DIR_ENTRY_SIZE
             # Traverse the next cluster from FAT
             if offset >= cluster_byte_size:
